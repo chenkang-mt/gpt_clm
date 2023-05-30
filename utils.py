@@ -2,23 +2,28 @@ import json
 import os
 import uuid
 import time
+import mlflow
 import torch
 
 import logging
 import time
 from accelerate.logging import get_logger
+import horovod.torch as hvd
 
 logger = get_logger(__name__)
 CHECKPOINT_META_NAME = "checkpoint.meta"
 
 def init_logs(log_dir, rank):
     cur_date  = time.strftime("%Y-%m-%d-%H-%M", time.localtime())
+    log_file = os.path.join(log_dir, f"{cur_date}_train_{rank}.log")
     logging.basicConfig(
-        filename=os.path.join(log_dir, f"{cur_date}_train_{rank}.log"),
+        filename= log_file,
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
+    return log_file
 
 
 
@@ -117,13 +122,14 @@ def timecost_wrapper(func):
 
 
 class TimeTicker:
-    def __init__(self, name, switch=True):
+    def __init__(self, name, switch=True, reporter=False, step=0):
         self.start_time = None
         self.end_time = None
         self.time_cost = None
         self.name  = name
         self.switch = switch
-        self.reporter = None
+        self.reporter = reporter
+        self.step = step
 
     def __enter__(self):
         self.start_time = time.time()
@@ -134,4 +140,16 @@ class TimeTicker:
         self.time_cost = self.end_time - self.start_time
 
         if self.switch:
-            logger.info(f"time cost op:{self.name}, cost:{self.time_cost}")
+            logger.info(f"time cost op:{self.name}, cost:{self.time_cost}, step:{self.step}")
+            if self.reporter and hvd.rank() == 0:
+                mlflow.log_metric(self.name, self.time_cost, step=self.step)
+        
+
+
+@timecost_wrapper
+def cal_model_size(model):
+    total_size = 0
+    for param in model.parameters():
+        total_size += torch.numel(param)
+
+    return total_size

@@ -54,7 +54,7 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 import horovod.torch as hvd
-from utils import TimeTicker, timecost_wrapper, load_ckpt, save_ckpt, init_logs, logger
+from utils import TimeTicker, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt, init_logs, logger
 import config
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -208,13 +208,17 @@ def build_model():
 
     return model
 
+def is_master():
+    if hvd.rank() == 0:
+        return True
+    return False
+
 
 def main():
-
     import_patch(args.device)
 
     device = torch.device(args.device)
-    init_logs(args.log_dir, hvd.rank())
+    log_file = init_logs(args.log_dir, hvd.rank())
     datasets.utils.logging.set_verbosity_warning()
     transformers.utils.logging.set_verbosity_info()
     datasets.utils.logging.set_verbosity_error()
@@ -227,6 +231,9 @@ def main():
     # Handle the repository creation
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    if is_master():
+        mlflow.log_params(vars(args))
 
     tokenizer = load_tokenizer()
     train_dataset = create_dataset(tokenizer)
@@ -268,6 +275,8 @@ def main():
         ]
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
+    model_size = cal_model_size(model)
+    logger.info(f"succeed  to load model, and model size is {model_size}")
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
 
@@ -347,18 +356,18 @@ def main():
                     pass
 
             cond =  step % 20
-            with TimeTicker("step_train", not cond) as t:
+            with TimeTicker("step_train", not cond, True, completed_steps) as t:
                 batch['input_ids'] = batch['input_ids'].to(device)
                 batch['attention_mask'] = batch['attention_mask'].to(device)
                 batch['labels'] = batch['labels'].to(device)
             
-                with TimeTicker("forward") as t:
+                with TimeTicker("forward", not cond, True, completed_steps) as t:
                    outputs = model(**batch)
 
                 loss = outputs.loss
                 total_loss += loss.detach().float()
 
-                with TimeTicker("backward", not cond) as t:
+                with TimeTicker("backward", not cond, True, completed_steps) as t:
                    loss.backward()
 
                 has_nan = False
@@ -386,11 +395,12 @@ def main():
                 train_time = time.time() - start_train
                 train_fps =  total_sample / train_time
 
-                logger.info(f"epoch {epoch}, step {step}, train_loss: {loss}  train_time: {train_time:.3f}  train_fps: {train_fps:.3f}")
-
-            
-                # progress_bar.update(1)
-                completed_steps += 1
+            logger.info(f"epoch {epoch}, step {completed_steps}, train_loss: {loss}  train_time: {train_time:.3f}  train_fps: {train_fps:.3f}")
+            completed_steps += 1
+            if is_master: 
+                mlflow.log_metric("loss", loss, completed_steps)
+                mlflow.log_metrics("train_qps", train_fps, completed_steps)
+                
                 #completed_steps = hvd.allreduce(torch.tensor(completed_steps), name='completed_steps').item()
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
@@ -403,11 +413,27 @@ def main():
         train_time = time.time() - start_train
         train_fps = len(train_dataloader.dataset) / train_time
         logger.info(f"epoch {epoch}: train_loss: {total_loss.item() / len(train_dataloader):.3f}  train_time: {train_time:.3f}  train_fps: {train_fps:.3f}")
-
+        if is_master:
+            mlflow.log_artifact(log_file, "exp.log")
 
 
 args = config.parse_args()
 
 if __name__ == "__main__":
     hvd.init()
-    main()
+
+    if hvd.rank() == 0:
+        import sys
+        import mlflow
+        import system
+        import hardware
+        mtags = {
+            "python": sys.version,
+            "pytorch": torch.__version__,
+            "cpu": system.obtain_cpu_info(),
+            "gpu": hardware.obtain_mtgpu_info(),
+        }
+        with mlflow.start_run(run_name="gpt2-ddp-k256", tags=mtags) as run:
+            main()
+    else:
+        main()

@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument(
         "--block_size",
         type=int,
-        default=None,
+        default=512,
         help=(
             "Optional input sequence length after tokenization. The training dataset will be truncated in block of"
             " this size for training. Default to the model max input length for single sentence inputs (take into"
