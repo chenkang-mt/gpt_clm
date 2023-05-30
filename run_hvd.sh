@@ -19,7 +19,9 @@ horovodrun -np 1 -H 127.0.0.1:1 python3 train_hvd_clm.py \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
     --checkpointing_steps 1000 \
-    --output_dir $DATA/clm-output \
+    --output_dir $DATA/output \
     --cache_dir $DATA/cache \
     --from_checkpoint_meta $DATA/checkpoints \
-    --log_dir $DATA/logs
+    --log_dir $DATA/logs \
+    --checkpointing_steps 60 \
+    --resume_from_checkpoint 1

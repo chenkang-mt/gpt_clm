@@ -54,7 +54,7 @@ from transformers import (
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 import horovod.torch as hvd
-from utils import TimeTicker, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt, init_logs, logger
+from utils import TimeTicker, timecost_stat, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt, init_logs, logger
 import config
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -252,28 +252,29 @@ def main():
 
     start_epoch = 0
     start_step = 0
-    if args.resume_from_checkpoint:
-        model, optimizer, start_epoch, start_step = load_ckpt(args.output_dir)
-    else:
-        model = build_model()
-        embedding_size = model.get_input_embeddings().weight.shape[0]
-        if len(tokenizer) > embedding_size:
-            model.resize_token_embeddings(len(tokenizer))
+    
+    model = build_model()
+    embedding_size = model.get_input_embeddings().weight.shape[0]
+    if len(tokenizer) > embedding_size:
+        model.resize_token_embeddings(len(tokenizer))
 
         # Optimizer
         # Split weights in two groups, one with weight decay and the other not.
-        no_decay = ["bias", "layer_norm.weight"]
-        optimizer_grouped_parameters = [
-          {
+    no_decay = ["bias", "layer_norm.weight"]
+    optimizer_grouped_parameters = [
+      {
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
-          },
-          {
+      },
+      {
             "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
             "weight_decay": 0.0,
-          },
-        ]
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+      },
+    ]
+    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+    
+    if args.resume_from_checkpoint:
+        start_epoch, start_step = load_ckpt(model, optimizer, args.output_dir)
 
     model_size = cal_model_size(model)
     logger.info(f"succeed  to load model, and model size is {model_size}")
@@ -349,13 +350,18 @@ def main():
         model.train()
         total_loss = 0
         total_sample = 0
-        for step, batch in enumerate(train_dataloader):
+        io_start = time.time()
+        for step, batch in enumerate(train_dataloader) :
+            
             # We need to skip steps until we reach the resumed step
             if  epoch == starting_epoch:
                 if resume_step is not None and step < resume_step:
                     pass
 
             cond =  step % 20
+            if not cond:
+                mlflow.log_metric("data_loader", time.time() -  io_start, completed_steps)
+
             with TimeTicker("step_train", not cond, True, completed_steps) as t:
                 batch['input_ids'] = batch['input_ids'].to(device)
                 batch['attention_mask'] = batch['attention_mask'].to(device)
@@ -385,6 +391,7 @@ def main():
                 if has_nan:
                     logger.info('gradient has nan, drop this step')
                     optimizer.zero_grad()
+                    io_start = time.time()
                     continue
                 
                 optimizer.step()
@@ -394,19 +401,20 @@ def main():
                 total_sample +=  len(batch['input_ids'])
                 train_time = time.time() - start_train
                 train_fps =  total_sample / train_time
+                io_start = time.time()
 
             logger.info(f"epoch {epoch}, step {completed_steps}, train_loss: {loss}  train_time: {train_time:.3f}  train_fps: {train_fps:.3f}")
-            completed_steps += 1
+
             if is_master: 
                 mlflow.log_metric("loss", loss, completed_steps)
-                mlflow.log_metrics("train_qps", train_fps, completed_steps)
+                mlflow.log_metric("train_qps", train_fps, completed_steps)
                 
                 #completed_steps = hvd.allreduce(torch.tensor(completed_steps), name='completed_steps').item()
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0:
-                    if(hvd.rank() == 0):
-                        save_ckpt(args.output_dir, model, optimizer, hvd.rank(), epoch, completed_steps)
-                
+            if completed_steps % checkpointing_steps == 0:
+                if hvd.rank() == 0:
+                    save_ckpt(args.output_dir, model, optimizer, hvd.rank(), epoch, completed_steps)
+            
+            completed_steps += 1
             if completed_steps >= args.max_train_steps:
                 break
 

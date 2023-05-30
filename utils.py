@@ -25,8 +25,20 @@ def init_logs(log_dir, rank):
 
     return log_file
 
+def timecost_wrapper(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        time_cost = end_time - start_time
 
+        cost = {func.__name__ : time_cost}
+        logger.info(f"time cost statistics: {cost}")
+        return result
+    
+    return wrapper
 
+@timecost_wrapper
 def load_latest_ckpt_meta(ckpt: str):
     if len(ckpt) == 0:
         return
@@ -42,7 +54,7 @@ def load_latest_ckpt_meta(ckpt: str):
 
     return meta
 
-
+@timecost_wrapper
 def save_latest_ckpt_meta(ckpt: str, meta: dict):
     if len(meta) == 0:
         return
@@ -62,11 +74,12 @@ def save_latest_ckpt_meta(ckpt: str, meta: dict):
     return
 
 
-
+@timecost_wrapper
 def save_ckpt(prefix:str, model, optimizer, rank, epoch, step):
     try:
-        ckpts = os.join(prefix, "checkpoints")
-        os.mkdir(ckpts)
+        ckpts = os.path.join(prefix, "checkpoints")
+        print(f"create checkpoints dirs:{ckpts}")
+        os.makedirs(ckpts)
     except Exception as e:
         pass
 
@@ -75,38 +88,38 @@ def save_ckpt(prefix:str, model, optimizer, rank, epoch, step):
     
     state = f'{cur_date}_rank_{rank}_epoch_{epoch}_step{step}'
     model_file = os.path.join(ckpts, f'{state}.pt')
-    meta.update("model", model_file)
-    torch.save({model, model_file})
+    meta.update({"model": model_file})
+    torch.save(model.state_dict(), model_file)
 
     optim_file = os.path.join(ckpts, f'{state}.opt')
-    torch.save(optimizer, optim_file)
-    meta.update({"optimizer", model_file})
+    torch.save(optimizer.state_dict(), optim_file)
+    meta.update({"optimizer": optim_file})
 
-    meta.update({"epoch", epoch})
-    meta.update({"step", step})
-    meta.update({"rank", rank})
+    meta.update({"epoch": epoch})
+    meta.update({"step": step})
+    meta.update({"rank": rank})
 
     save_latest_ckpt_meta(os.path.join(prefix, CHECKPOINT_META_NAME), meta)
 
-
-def load_ckpt(prefix: str):
+@timecost_wrapper
+def load_ckpt(model, opt, prefix: str):
     meta = load_latest_ckpt_meta(os.path.join(prefix, CHECKPOINT_META_NAME))
     if not meta:
-        return None, None, None, None
+        return  0, 0
     
     try:
         if "model" in meta:
-            model = torch.load(meta["model"])
-        if "optim" in meta:
-            opt = torch.load(meta["optimizer"])
+            model.load_state_dict(torch.load(meta["model"]))
+        if "optimizer" in meta:
+            opt.load_state_dict(torch.load(meta["optimizer"]))
     except Exception as e:
         raise(f"model load exception: {e}")
         
-    return model, opt, meta["epoch"], meta["step"]
+    return  meta["epoch"], meta["step"]
 
 
 
-def timecost_wrapper(func):
+def timecost_stat(func, name, report=True, step=0):
     def wrapper(*args, **kwargs):
         start_time = time.time()
         result = func(*args, **kwargs)
@@ -115,6 +128,9 @@ def timecost_wrapper(func):
 
         cost = {func.__name__ : time_cost}
         logger.info(f"time cost statistics: {cost}")
+        if report:
+            mlflow.log_metric(name, time_cost, step)
+
         return result
     
     return wrapper
