@@ -171,6 +171,9 @@ def create_dataset(tokenizer):
 def load_tokenizer():
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
+    if args.save_dir:
+        t_dir = os.path.join(args.save_dir, "tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(t_dir, use_fast=not args.use_slow_tokenizer)
     elif args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
     else:
@@ -185,18 +188,29 @@ def load_tokenizer():
 def build_model():
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name)
+    elif args.save_dir:
+        m_dir = os.path.join(args.save_dir, "models")
+        config = AutoConfig.from_pretrained(m_dir, cache_dir=args.cache_dir)
     elif args.model_name_or_path:
         config = AutoConfig.from_pretrained(args.model_name_or_path, cache_dir=args.cache_dir)
     else:
         config = CONFIG_MAPPING[args.model_type]()
         logger.warning("You are instantiating a new config instance from scratch.")
 
-
-    if args.model_name_or_path:
+    if args.save_dir:
+        model = AutoModelForCausalLM.from_pretrained(
+            m_dir,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+            cache_dir=args.cache_dir,
+            low_cpu_mem_usage=args.low_cpu_mem_usage,
+        )
+    elif args.model_name_or_path:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
+            cache_dir=args.cache_dir,
             low_cpu_mem_usage=args.low_cpu_mem_usage,
         )
     else:
@@ -410,7 +424,7 @@ def main():
                 mlflow.log_metric("train_qps", train_fps, completed_steps)
                 
                 #completed_steps = hvd.allreduce(torch.tensor(completed_steps), name='completed_steps').item()
-            if completed_steps % checkpointing_steps == 0:
+            if completed_steps % checkpointing_steps == 0 and  completed_steps:
                 if hvd.rank() == 0:
                     save_ckpt(args.output_dir, model, optimizer, hvd.rank(), epoch, completed_steps)
             
@@ -430,11 +444,12 @@ args = config.parse_args()
 if __name__ == "__main__":
     hvd.init()
 
+    import sys
+    import mlflow
+    import system
+    import hardware
+    
     if hvd.rank() == 0:
-        import sys
-        import mlflow
-        import system
-        import hardware
         mtags = {
             "python": sys.version,
             "pytorch": torch.__version__,

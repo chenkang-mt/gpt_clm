@@ -116,7 +116,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=100,
+        default=10000,
         help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
     )
     parser.add_argument(
@@ -167,6 +167,13 @@ def parse_args():
         type=str,
         default="./logs",
         help=("loggin output dir"),
+    )
+
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=None,
+        help=("save dataset/model dir")
     )
 
     conf = parser.parse_args()

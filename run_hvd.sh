@@ -16,6 +16,8 @@ horovodrun -np 1 -H 127.0.0.1:1 python3 train_hvd_clm.py \
     --model_name_or_path gpt2 \
     --dataset_name wikitext \
     --dataset_config_name wikitext-103-raw-v1 \
+    --num_train_epochs 200 \
+    --block_size 512 \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
     --checkpointing_steps 1000 \
@@ -23,5 +25,6 @@ horovodrun -np 1 -H 127.0.0.1:1 python3 train_hvd_clm.py \
     --cache_dir $DATA/cache \
     --from_checkpoint_meta $DATA/checkpoints \
     --log_dir $DATA/logs \
-    --checkpointing_steps 60 \
-    --resume_from_checkpoint 1
+    --checkpointing_steps 1000 \
+    --resume_from_checkpoint 1 \
+    --save_dir $DATA

@@ -14,7 +14,12 @@ logger = get_logger(__name__)
 CHECKPOINT_META_NAME = "checkpoint.meta"
 
 def init_logs(log_dir, rank):
-    cur_date  = time.strftime("%Y-%m-%d-%H-%M", time.localtime())
+    try:
+        os.makedirs(log_dir)
+    except Exception as e:
+        pass
+
+    cur_date  = time.strftime("%Y-%m-%d-%H", time.localtime())
     log_file = os.path.join(log_dir, f"{cur_date}_train_{rank}.log")
     logging.basicConfig(
         filename= log_file,
@@ -50,7 +55,7 @@ def load_latest_ckpt_meta(ckpt: str):
             if len(data) > 0:
                 meta = json.loads(data)
     except Exception as e:
-        print("load_latest_ckpt_meta catch exception:", e)
+        logger.info(f"load_latest_ckpt_meta catch exception:{e}")
 
     return meta
 
@@ -69,7 +74,7 @@ def save_latest_ckpt_meta(ckpt: str, meta: dict):
 
         os.rename(tmp_file, ckpt)
     except Exception as e:
-        logger.info("save_latest_ckpt_meta catch exception:", e)
+        logger.info(f"save_latest_ckpt_meta catch exception:{e}")
 
     return
 
@@ -78,7 +83,7 @@ def save_latest_ckpt_meta(ckpt: str, meta: dict):
 def save_ckpt(prefix:str, model, optimizer, rank, epoch, step):
     try:
         ckpts = os.path.join(prefix, "checkpoints")
-        print(f"create checkpoints dirs:{ckpts}")
+        logger.info(f"create checkpoints dirs:{ckpts}")
         os.makedirs(ckpts)
     except Exception as e:
         pass
