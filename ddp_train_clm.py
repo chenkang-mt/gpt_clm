@@ -31,6 +31,7 @@ from itertools import chain
 from pathlib import Path
 import time
 import datasets
+import torch_musa
 import torch
 
 from accelerate import Accelerator, DistributedType
@@ -53,12 +54,19 @@ from transformers import (
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
-import horovod.torch as hvd
 from utils import TimeTicker, timecost_stat, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt 
 from  log import init_logs, logger
 from utils import configure_training_profiler, trace_handler
 import config 
 from  metrics import init_prometheus, push_metrics, start_timer, report_loss
+
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import torch.multiprocessing as mp
+
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -71,27 +79,25 @@ MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def rank():
-    return hvd.rank()
+    return dist.get_rank()
 
 def world_size():
-    return hvd.size()
+    return dist.get_world_size()
 
-def import_patch(device: str):
-    if device in ("mtgpu", "musa"):
-        os.environ["PVR_GPUIDX"] = str(hvd.local_rank())
-        os.environ["MTGPU_MAX_MEM_USAGE_GB"] = "31"
+def setup():
+    #os.environ['MASTER_ADDR'] = 'localhost'
+    #os.environ['MASTER_PORT'] = '12355'
+    # initialize the process group
+    # dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("gloo")
+    torch_musa.set_device(rank() % torch.musa.device_count())
 
-    try:
-        if device == "mtgpu":
-            import musa_torch_extension
-        elif device == "musa":
-            import torch_musa
-    except Exception as e:
-        raise Exception(f"import musa patch exception: {e}")
+def cleanup():
+    dist.destroy_process_group()
 
 
     
-@timecost_wrapper
+@timecost_wrapper(world_size(), rank())
 def create_dataset(tokenizer):
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
@@ -176,7 +182,7 @@ def create_dataset(tokenizer):
     
 
 
-@timecost_wrapper
+@timecost_wrapper(world_size(), rank())
 def load_tokenizer():
     if args.tokenizer_name:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name, use_fast=not args.use_slow_tokenizer)
@@ -193,7 +199,7 @@ def load_tokenizer():
     
     return tokenizer
 
-@timecost_wrapper
+@timecost_wrapper(world_size(), rank())
 def build_model():
     if args.config_name:
         config = AutoConfig.from_pretrained(args.config_name)
@@ -225,12 +231,13 @@ def build_model():
     device = torch.device(args.device)
     model = model.to(device)
 
-    return model
+    ddp_model = DDP(model, device_ids=[rank()])
+
+    return ddp_model
 
 def is_master():
     if rank() == 0:
         return True
-    
     return False
 
 def prof_switch():
@@ -240,19 +247,17 @@ def prof_switch():
     return False
 
 def main():
-    import_patch(args.device)
 
     device = torch.device(args.device)
-    log_file = init_logs(args.log_dir, hvd.rank())
+    log_file = init_logs(args.log_dir, rank())
     datasets.utils.logging.set_verbosity_warning()
     transformers.utils.logging.set_verbosity_info()
     datasets.utils.logging.set_verbosity_error()
     transformers.utils.logging.set_verbosity_error()
 
-    init_prometheus(args.gateway, "musa-hvd-gpt2", "test")
+    init_prometheus(args.gateway, "musa-ddp-gpt2", "test")
     
 
-    
 
     # If passed along, set the training seed now.
     if args.seed is not None:
@@ -269,8 +274,9 @@ def main():
     train_dataset = create_dataset(tokenizer)
     train_sampler = torch.utils.data.distributed.DistributedSampler(
         train_dataset,
-        num_replicas=hvd.size(), 
-        rank=hvd.rank())
+        num_replicas=world_size(), 
+        rank=rank())
+    
     train_dataloader = DataLoader(
         train_dataset, 
         collate_fn=default_data_collator, 
@@ -284,9 +290,7 @@ def main():
     start_step = 0
     
     model = build_model()
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
+
 
         # Optimizer
         # Split weights in two groups, one with weight decay and the other not.
@@ -307,20 +311,11 @@ def main():
         start_epoch, start_step = load_ckpt(model, optimizer, args.output_dir)
 
     model_size = cal_model_size(model)
-    start_timer(hvd.size(), args.per_device_train_batch_size, args.block_size, hvd.rank(), model_size)
+    start_timer(world_size(), args.per_device_train_batch_size, args.block_size, rank(), model_size)
     logger.info(f"succeed  to load model, and model size is {model_size}")
     # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
     # on a small vocab and want a smaller embedding size, remove this test.
 
-    optimizer = hvd.DistributedOptimizer(
-        optimizer,
-        named_parameters=model.named_parameters(),
-        compression=hvd.Compression.none,
-        op=hvd.Average,  # hvd.Adasum if args.use_adasum else hvd.Average,
-    )
-
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -398,20 +393,20 @@ def main():
             if not cond and is_master():
                 mlflow.log_metric("data_loader", time.time() -  io_start, completed_steps)
 
-            with TimeTicker("step_train", world_size(), rank(), True, True, completed_steps) as t:
+            with TimeTicker("step_train",world_size(), rank(), True, True, completed_steps) as t:
                 batch['input_ids'] = batch['input_ids'].to(device)
                 batch['attention_mask'] = batch['attention_mask'].to(device)
                 batch['labels'] = batch['labels'].to(device)
             
-                with TimeTicker("forward", world_size(), rank(), True, True, completed_steps) as t:
+                with TimeTicker("forward", True, True, completed_steps) as t:
                     outputs = model(**batch)
                     # torch.musa.synchronize()
 
                 loss = outputs.loss
                 total_loss += loss.detach().float()
-                report_loss(args.learning_rate, loss.item(), completed_steps, hvd.rank())
+                report_loss(args.learning_rate, loss.item(), completed_steps, rank())
 
-                with TimeTicker("backward", world_size(), rank(), True, True, completed_steps) as t:
+                with TimeTicker("backward", True, True, completed_steps) as t:
                     loss.backward()
                     # torch.musa.synchronize()
                 '''   
@@ -451,7 +446,7 @@ def main():
             logger.info(f"epoch {epoch}, step {completed_steps}, train_loss: {loss}  train_time: {train_time:.3f}  train_fps: {train_fps:.3f}")
 
             if is_master(): 
-                mlflow.log_metric("num_procs", hvd.size())
+                mlflow.log_metric("num_procs", world_size())
                 mlflow.log_metric("seq_len", args.block_size)
                 mlflow.log_metric("batch_size", args.per_device_train_batch_size)
                 mlflow.log_metric("loss", loss, completed_steps)
@@ -459,8 +454,8 @@ def main():
                 
                 #completed_steps = hvd.allreduce(torch.tensor(completed_steps), name='completed_steps').item()
             if completed_steps % checkpointing_steps == 0 and  completed_steps:
-                if hvd.rank() == 0:
-                    save_ckpt(args.output_dir, model, optimizer, hvd.rank(), epoch, completed_steps)
+                if rank() == 0:
+                    save_ckpt(args.output_dir, model, optimizer, rank(), epoch, completed_steps)
         
             completed_steps += 1
             if completed_steps >= args.max_train_steps:
@@ -477,15 +472,16 @@ def main():
 
 args = config.parse_args()
 
+
 if __name__ == "__main__":
-    hvd.init()
+    setup()
 
     import sys
     import mlflow
     import system
     import hardware
     
-    if hvd.rank() == 0:
+    if rank() == 0:
         mtags = {
             "python": sys.version,
             "pytorch": torch.__version__,
@@ -493,7 +489,7 @@ if __name__ == "__main__":
             "gpu": hardware.obtain_mtgpu_info(),
         }
         
-        name = f"gpt2-ddp-k256-np{hvd.size()}-batch{args.per_device_train_batch_size}-seq{args.block_size} "
+        name = f"gpt2-ddp-k256-np{world_size()}-batch{args.per_device_train_batch_size}-seq{args.block_size} "
         with mlflow.start_run(run_name=name, tags=mtags) as run:
             main()
     else:

@@ -1,36 +1,29 @@
 import json
 import os
+from threading import Timer
 import uuid
 import time
+import random
 import mlflow
 import torch
 
 import logging
 import time
 from accelerate.logging import get_logger
-import horovod.torch as hvd
+from log import logger
 
-logger = get_logger(__name__)
+from metrics import push_metrics, build_registry
+from metrics import MyHistogram, MySummary, label_wrapper
+
+from torch.profiler import (
+    profile,
+    ProfilerActivity,
+    schedule,
+)
+
 CHECKPOINT_META_NAME = "checkpoint.meta"
 
-def init_logs(log_dir, rank):
-    try:
-        os.makedirs(log_dir)
-    except Exception as e:
-        pass
-
-    cur_date  = time.strftime("%Y-%m-%d-%H", time.localtime())
-    log_file = os.path.join(log_dir, f"{cur_date}_train_{rank}.log")
-    logging.basicConfig(
-        filename= log_file,
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-
-    return log_file
-
-def timecost_wrapper(func):
+def timecost_wrapper(func, world=0, rank=0):
     def wrapper(*args, **kwargs):
         start_time = time.time()
         result = func(*args, **kwargs)
@@ -38,6 +31,13 @@ def timecost_wrapper(func):
         time_cost = end_time - start_time
 
         cost = {func.__name__ : time_cost}
+
+        reg = build_registry()
+        s = MyHistogram(f'{func.__name__}_cost_seconds', 'op timecost',
+                      label_wrapper(["world", "op_name", "rank"]), registry=reg)
+        s.labels(name=func.__name__, op_name=func.__name__, world=world, rank=rank).observe(time_cost)
+        push_metrics(reg, rank)
+
         logger.info(f"time cost statistics: {cost}")
         return result
     
@@ -124,7 +124,7 @@ def load_ckpt(model, opt, prefix: str):
 
 
 
-def timecost_stat(func, name, report=True, step=0):
+def timecost_stat(func, name, rank, report=True, step=0):
     def wrapper(*args, **kwargs):
         start_time = time.time()
         result = func(*args, **kwargs)
@@ -133,7 +133,7 @@ def timecost_stat(func, name, report=True, step=0):
 
         cost = {func.__name__ : time_cost}
         logger.info(f"time cost statistics: {cost}")
-        if report:
+        if report and rank == 0:
             mlflow.log_metric(name, time_cost, step)
 
         return result
@@ -143,11 +143,13 @@ def timecost_stat(func, name, report=True, step=0):
 
 
 class TimeTicker:
-    def __init__(self, name, switch=True, reporter=False, step=0):
+    def __init__(self, name, world: int, rank: int, switch=True, reporter=False, step=0):
         self.start_time = None
         self.end_time = None
         self.time_cost = None
         self.name  = name
+        self.rank = rank
+        self.world = world
         self.switch = switch
         self.reporter = reporter
         self.step = step
@@ -160,9 +162,15 @@ class TimeTicker:
         self.end_time = time.time()
         self.time_cost = self.end_time - self.start_time
 
+
         if self.switch:
+            reg = build_registry()
+            s = MyHistogram(f'{self.name}_cost_seconds', 'op timecost', label_wrapper(["op_name", "world", "rank"]), registry=reg)
+            s.labels(name=self.name, op_name=self.name, world=self.world, rank=self.rank).observe(self.time_cost)
+            push_metrics(reg, self.rank)
+
             logger.info(f"time cost op:{self.name}, cost:{self.time_cost}, step:{self.step}")
-            if self.reporter and hvd.rank() == 0:
+            if self.reporter and self.rank == 0:
                 mlflow.log_metric(self.name, self.time_cost, step=self.step)
         
 
@@ -174,3 +182,23 @@ def cal_model_size(model):
         total_size += torch.numel(param)
 
     return total_size
+
+
+
+def trace_handler(p):
+    logger.info("trace handler enter...")
+    output = p.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1)
+    logger.info(output) 
+
+def configure_training_profiler(trace_handler) -> profile:
+    profile_schedule = schedule(wait=1, warmup=1, active=1)
+    profiler = profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=profile_schedule,
+        record_shapes=True,
+        on_trace_ready=trace_handler,
+        with_flops=True,
+        # profiler now provides `flops` attribute
+    )
+
+    return profiler

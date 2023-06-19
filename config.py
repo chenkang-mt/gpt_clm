@@ -176,6 +176,27 @@ def parse_args():
         help=("save dataset/model dir")
     )
 
+    parser.add_argument(
+        "--enable_prof",
+        type=int,
+        default=0,
+        help="Whether the various states should be saved at the end of every n steps, or 'epoch' for each epoch.",
+    )
+
+    parser.add_argument(
+        "--mlrun_uri",
+        type=str, 
+        default="/data01", 
+        help="mlruns path"
+    )
+
+    parser.add_argument(
+        "--gateway",
+        type=str, 
+        default="", 
+        help="mlruns path"
+    )
+
     conf = parser.parse_args()
 
     # Sanity checks
