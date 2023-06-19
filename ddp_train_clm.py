@@ -54,11 +54,11 @@ from transformers import (
 )
 from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
-from utils import TimeTicker, timecost_stat, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt 
-from  log import init_logs, logger
-from utils import configure_training_profiler, trace_handler
+from common.utils.utils import TimeTicker, timecost_stat, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt 
+from  common.logger.log import init_logs, logger
+from common.utils.utils import configure_training_profiler, trace_handler
 import config 
-from  metrics import init_prometheus, push_metrics, start_timer, report_loss
+from  common.telemetry.metrics import init_prometheus, push_metrics, start_timer, report_loss
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -478,8 +478,8 @@ if __name__ == "__main__":
 
     import sys
     import mlflow
-    import system
-    import hardware
+    import common.basic.system as system
+    import common.basic.hardware as hardware
     
     if rank() == 0:
         mtags = {

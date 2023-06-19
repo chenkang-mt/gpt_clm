@@ -20,25 +20,17 @@ Here is the full list of checkpoints on the hub that can be fine-tuned by this s
 https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
-
-import argparse
-import json
-import logging
 import math
 import os
 import random
 from itertools import chain
-from pathlib import Path
 import time
 import datasets
 import torch
 
-from accelerate import Accelerator, DistributedType
 from accelerate.utils import set_seed
 from datasets import load_dataset
-from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
 import transformers
 from transformers import (
@@ -47,18 +39,18 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
-    SchedulerType,
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 import horovod.torch as hvd
-from utils import TimeTicker, timecost_stat, cal_model_size, timecost_wrapper, load_ckpt, save_ckpt 
-from  log import init_logs, logger
-from utils import configure_training_profiler, trace_handler
+from common.utils.timecost import TimeTicker, timecost_wrapper
+from common.utils.utils import cal_model_size
+from common.utils.ckpt import load_ckpt, save_ckpt
+from  common.logger.log import init_logs, logger
+from common.utils.profile import configure_training_profiler, trace_handler
 import config 
-from  metrics import init_prometheus, push_metrics, start_timer, report_loss
+from  common.telemetry.metrics import init_prometheus, report_loss, start_timer
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -243,7 +235,7 @@ def main():
     import_patch(args.device)
 
     device = torch.device(args.device)
-    log_file = init_logs(args.log_dir, hvd.rank())
+    init_logs(args.log_dir, hvd.rank())
     datasets.utils.logging.set_verbosity_warning()
     transformers.utils.logging.set_verbosity_info()
     datasets.utils.logging.set_verbosity_error()
@@ -482,8 +474,8 @@ if __name__ == "__main__":
 
     import sys
     import mlflow
-    import system
-    import hardware
+    import common.basic.system as system
+    import common.basic.hardware as hardware
     
     if hvd.rank() == 0:
         mtags = {
