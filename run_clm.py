@@ -40,9 +40,6 @@ try:
     import musa_torch_extension
 except ImportError:
     print("import musa_torch_extension failed, check whether mtpytorch exists")
-from accelerate import Accelerator, DistributedType
-from accelerate.logging import get_logger
-from accelerate.utils import set_seed
 from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
@@ -66,7 +63,8 @@ from transformers.utils.versions import require_version
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 check_min_version("4.28.0")
 
-logger = get_logger(__name__)
+import logging
+logger = logging.getLogger('mylogger')
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
@@ -74,12 +72,13 @@ MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 
+hist_loss = 99999.99
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        default='wikitext',
         help="The name of the dataset to use (via the datasets library).",
     )
     parser.add_argument(
@@ -164,8 +163,9 @@ def parse_args():
     parser.add_argument(
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
-    parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
+    parser.add_argument("--output_dir", type=str, default='test-clm', help="Where to store the final model.")
     parser.add_argument("--cache_dir", type=str, default=None, help="Where to store the dataset.")
+    parser.add_argument("--data_dir", type=str, default=None, help="Where to store the dataset locally.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--model_type",
@@ -239,7 +239,7 @@ def parse_args():
     parser.add_argument(
         "--device",
         type=str,
-        required=True
+        default="musa",
     )
     args = parser.parse_args()
 
@@ -260,12 +260,11 @@ def parse_args():
     return args
 
 
-def main():
-    args = parse_args()
-
+def main(args):
+    
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
-    send_example_telemetry("run_clm_no_trainer", args)
+    # send_example_telemetry("run_clm_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -325,19 +324,12 @@ def main():
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir)
-        if "validation" not in raw_datasets.keys():
-            raw_datasets["validation"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[:{args.validation_split_percentage}%]",
-            )
-            raw_datasets["train"] = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                split=f"train[{args.validation_split_percentage}%:]",
-            )
+        data_files = {}
+        data_files["train"] = args.data_dir + '/wiki.train.raw'
+        data_files["validation"] = args.data_dir + '/wiki.valid.raw'
+        data_files["test"] = args.data_dir + '/wiki.test.raw'
+
+        raw_datasets = load_dataset('text', data_files=data_files)
     else:
         data_files = {}
         dataset_args = {}
@@ -686,7 +678,6 @@ def main():
 
     
 
-
 def evaluate(model, eval_dataloader, epoch, device, args):
     model.eval()
     losses = []
@@ -710,6 +701,8 @@ def evaluate(model, eval_dataloader, epoch, device, args):
     eval_time = time.time() - start
     eval_fps = len(eval_dataloader.dataset) / eval_time
     logger.info(f"epoch {epoch}: perplexity: {perplexity:.3f} eval_loss: {eval_loss:.3f}  eval_time: {eval_time:.3f}  eval_fps: {eval_fps:.3f}")
+    global hist_loss
+    hist_loss = min(hist_loss, eval_loss)
 
 
 def test(model, test_dataloader, epoch, device, args):
@@ -738,6 +731,20 @@ def test(model, test_dataloader, epoch, device, args):
     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
         json.dump({"test_perplexity": perplexity}, f)
 
+def run_musa_gpt2(config):
+    args = parse_args()
+    args.device = 'musa'
+    args.model = 'Gpt2'
+    args.per_device_train_batch_size = config['batch_size']
+    args.per_device_eval_batch_size = config['batch_size']
+    args.data_dir = config['data_path']
+    args.num_train_epochs = config['epoch_num']
+    args.model_name_or_path = config['model_path']
+    main(args)
+
+    musa_result = {"metrics": {"Loss":hist_loss}} # 0.5 and 0.78 should from summary["benchmark_result"]["metrics"][1]["Acc1"]
+    return musa_result
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(args)
