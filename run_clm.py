@@ -241,6 +241,12 @@ def parse_args():
         type=str,
         default="musa",
     )
+    parser.add_argument(
+        "-s",
+        type=str,
+        default="unused",
+        help=("This parameter is not used, it is only for pytest in test_models repo!"),
+    )
     args = parser.parse_args()
 
     # Sanity checks
